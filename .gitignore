@@ -1,0 +1,3 @@
+*.app/
+.claude
+.DS_Store
