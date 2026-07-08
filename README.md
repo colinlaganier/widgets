@@ -1,10 +1,10 @@
-# Desktop widgets
+<h2 align="center">Desktop Widgets</h2>
 
 Small AppKit/SwiftUI desktop widgets (Azure, Claude usage, GitHub,
 Hacker News, W&B). Each lives in its own directory as a single `main.swift`
 built into a standalone `.app` by its `build.sh`.
 
-## Shared layout system (`shared/WidgetChrome.swift`)
+## Shared layout system
 
 Window placement behaviour is shared, not per-widget: every `build.sh`
 compiles `shared/WidgetChrome.swift` in alongside `main.swift`, and each
