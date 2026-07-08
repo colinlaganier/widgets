@@ -1,3 +1,4 @@
 *.app/
 .claude
 .DS_Store
+build_err.log
