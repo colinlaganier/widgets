@@ -1,5 +1,9 @@
 <h2 align="center">Desktop Widgets</h2>
 
+<p align="center">
+  <a href="#"><img src="https://img.shields.io/badge/Claude-D97757?logo=claude&logoColor=fff" alt="Claude"></a>
+</p>
+
 Small AppKit/SwiftUI desktop widgets (Azure, Claude usage, GitHub,
 Hacker News, W&B). Each lives in its own directory as a single `main.swift`
 built into a standalone `.app` by its `build.sh`.
