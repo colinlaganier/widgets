@@ -20,7 +20,17 @@ virtual machines and lets you start or shut them down.
   Remote-SSH (`code --new-window --remote ssh-remote+user@host`, using the
   VM's admin username and its FQDN or public IP). Enabled only while the VM
   is running and has a public address.
-- Right-click the widget for Refresh, Open Azure Portal, Open Log, and Quit.
+
+  The first time you connect to a VM, the widget asks for the SSH private
+  key to use (VS Code's Remote-SSH has no key prompt of its own — it only
+  reads `~/.ssh/config`). The widget writes a marked `Host` block with the
+  key's `IdentityFile` into `~/.ssh/config` and rewrites it on every connect,
+  so the entry stays current when a deallocated VM comes back with a new
+  public IP. Picking a `.pub` file substitutes the private key next to it;
+  cancelling connects with your default keys and asks again next time. To
+  re-pick a key, right-click the widget → "Change SSH Key…".
+- Right-click the widget for Refresh, Open Azure Portal, Open Log,
+  Change SSH Key, and Quit.
 
 ## Auth
 

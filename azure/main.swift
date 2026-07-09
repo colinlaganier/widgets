@@ -23,12 +23,16 @@ struct AzureVM: Codable, Identifiable, Hashable {
 
     var id: String { "\(resourceGroup)/\(name)" }
 
-    /// "user@host" for Remote-SSH; nil while the VM has no reachable address.
-    var sshTarget: String? {
-        let host = [fqdns, publicIps]
+    /// First reachable address; nil while the VM has none.
+    var sshHost: String? {
+        [fqdns, publicIps]
             .compactMap { $0?.split(separator: ",").first.map(String.init) }
             .first { !$0.isEmpty }
-        guard let host else { return nil }
+    }
+
+    /// "user@host" for Remote-SSH; nil while the VM has no reachable address.
+    var sshTarget: String? {
+        guard let host = sshHost else { return nil }
         guard let adminUsername, !adminUsername.isEmpty else { return host }
         return "\(adminUsername)@\(host)"
     }
@@ -166,6 +170,93 @@ enum VSCode {
     }
 }
 
+// MARK: - SSH config
+
+/// VS Code's Remote-SSH extension has no key prompt of its own — it reads
+/// ~/.ssh/config. So the widget asks for the key file once per VM and keeps
+/// a marked Host block in that file up to date (the public IP changes every
+/// time a deallocated VM starts).
+enum SSHConfig {
+    private static let defaultsKey = "sshKeyPaths"
+    private static let sshDir = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".ssh", isDirectory: true)
+    private static let configURL = sshDir.appendingPathComponent("config")
+
+    static func keyPath(for vmID: String) -> String? {
+        let paths = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: String]
+        return paths?[vmID]
+    }
+
+    static func setKeyPath(_ path: String, for vmID: String) {
+        var paths = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: String] ?? [:]
+        paths[vmID] = path
+        UserDefaults.standard.set(paths, forKey: defaultsKey)
+    }
+
+    /// Modal file picker for the key. Returns nil if the user cancels.
+    static func promptForKey(vmName: String) -> String? {
+        let panel = NSOpenPanel()
+        panel.message = "Select the SSH private key for \(vmName) (used by VS Code Remote-SSH)"
+        panel.prompt = "Use Key"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = sshDir
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+
+        // A .pub was picked but the private key sits next to it — use that.
+        var path = url.path
+        if path.hasSuffix(".pub") {
+            let privatePath = String(path.dropLast(4))
+            if FileManager.default.fileExists(atPath: privatePath) {
+                path = privatePath
+            }
+        }
+        return path
+    }
+
+    /// Inserts or replaces this VM's Host block in ~/.ssh/config.
+    static func writeEntry(vmID: String, host: String, user: String?, identityFile: String) {
+        let begin = "# >>> azure-widget \(vmID) >>>"
+        let end = "# <<< azure-widget \(vmID) <<<"
+        var block = "\(begin)\nHost \(host)\n"
+        if let user, !user.isEmpty {
+            block += "    User \(user)\n"
+        }
+        block += "    IdentityFile \"\(identityFile)\"\n\(end)"
+
+        var config = (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
+
+        // Drop any previous block for this VM (the host may have changed).
+        if let beginRange = config.range(of: begin),
+           let endRange = config.range(of: end, range: beginRange.upperBound..<config.endIndex) {
+            var removal = beginRange.lowerBound..<endRange.upperBound
+            if endRange.upperBound < config.endIndex,
+               config[endRange.upperBound] == "\n" {
+                removal = beginRange.lowerBound..<config.index(after: endRange.upperBound)
+            }
+            config.removeSubrange(removal)
+        }
+
+        config = config.trimmingCharacters(in: .newlines)
+        config = config.isEmpty ? block + "\n" : config + "\n\n" + block + "\n"
+
+        do {
+            try FileManager.default.createDirectory(
+                at: sshDir, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+            try config.write(to: configURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: configURL.path)
+            WidgetLog.write("Updated ~/.ssh/config entry for \(host) (key: \(identityFile))")
+        } catch {
+            WidgetLog.write("Failed to update ~/.ssh/config: \(error.localizedDescription)")
+        }
+    }
+}
+
 // MARK: - Model
 
 final class AzureModel: ObservableObject {
@@ -291,9 +382,33 @@ final class AzureModel: ObservableObject {
     func stopVM() { perform("deallocate", label: "Shutting down", optimisticState: "VM deallocating") }
 
     func connectVSCode() {
-        guard let vm = selectedVM, let target = vm.sshTarget else { return }
+        guard let vm = selectedVM, let target = vm.sshTarget, let host = vm.sshHost else { return }
+        // First connection to this VM: ask which key to use. Cancelling
+        // connects without one (ssh falls back to default keys / the agent)
+        // and asks again next time.
+        var keyPath = SSHConfig.keyPath(for: vm.id)
+        if keyPath == nil, let picked = SSHConfig.promptForKey(vmName: vm.name) {
+            SSHConfig.setKeyPath(picked, for: vm.id)
+            keyPath = picked
+        }
+        if let keyPath {
+            // Rewrite every time — the public IP changes across deallocations.
+            SSHConfig.writeEntry(vmID: vm.id, host: host,
+                                 user: vm.adminUsername, identityFile: keyPath)
+        }
         WidgetLog.write("Opening VS Code Remote-SSH to \(target)")
         VSCode.openRemote(target)
+    }
+
+    /// Re-pick the key for the selected VM (context menu).
+    func changeSSHKey() {
+        guard let vm = selectedVM else { return }
+        guard let picked = SSHConfig.promptForKey(vmName: vm.name) else { return }
+        SSHConfig.setKeyPath(picked, for: vm.id)
+        if let host = vm.sshHost {
+            SSHConfig.writeEntry(vmID: vm.id, host: host,
+                                 user: vm.adminUsername, identityFile: picked)
+        }
     }
 
     private func perform(_ command: String, label: String, optimisticState: String) {
@@ -445,6 +560,9 @@ struct WidgetView: View {
                 NSWorkspace.shared.open(URL(string: "https://portal.azure.com/#browse/Microsoft.Compute%2FVirtualMachines")!)
             }
             Button("Open Log") { NSWorkspace.shared.open(WidgetLog.url) }
+            if model.selectedVM != nil {
+                Button("Change SSH Key…") { model.changeSSHKey() }
+            }
             Divider()
             WidgetChromeMenu()
             Divider()
