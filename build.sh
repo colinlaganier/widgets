@@ -130,6 +130,18 @@ fi
 echo "Built ${#built_apps[@]} widget(s):"
 for app in "${built_apps[@]}"; do echo "  $app"; done
 
+# --- launch ---------------------------------------------------------------
+echo
+for app in "${built_apps[@]}"; do
+    name="$(basename "$app" .app)"
+    # restart if already running so the freshly built binary takes over
+    if pkill -x "$name" 2>/dev/null; then
+        sleep 0.5
+    fi
+    open "$app"
+    echo "  Launched: $name"
+done
+
 # --- login items ---------------------------------------------------------
 add_login=""
 if [[ $auto_all -eq 1 ]]; then
@@ -146,5 +158,7 @@ if [[ "$add_login" =~ ^[yY] ]]; then
     done
     echo "Done. Manage these under System Settings > General > Login Items."
 fi
+
+
 
 [[ ${#failed[@]} -eq 0 ]]
