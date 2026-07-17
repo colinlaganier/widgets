@@ -140,7 +140,7 @@ final class GitHubModel: ObservableObject {
     @Published var updatedAt: Date?
     @Published var isRefreshing = false
 
-    static let pageSize = 4
+    static let pageSize = 3
     /// How many items we fetch (pageSize × number of pages).
     private static let itemCount = 28
 
