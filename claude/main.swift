@@ -35,6 +35,7 @@ struct UsageResponse: Decodable {
 enum WidgetError: Error {
     case noCredentials
     case authExpired
+    case keychainWriteFailed
     case rateLimited(retryAfter: TimeInterval?)
     case http(Int)
     case badResponse
@@ -42,7 +43,8 @@ enum WidgetError: Error {
     var message: String {
         switch self {
         case .noCredentials: return "No Claude Code credentials found"
-        case .authExpired: return "Auth expired — open Claude Code"
+        case .authExpired: return "Auth refresh failed — open Claude Code"
+        case .keychainWriteFailed: return "Couldn't save refreshed token"
         case .rateLimited: return "Rate limited — retrying later"
         case .http(let code): return "Request failed (HTTP \(code))"
         case .badResponse: return "Unexpected response"
@@ -186,14 +188,20 @@ final class UsageModel: ObservableObject {
     }
 
     private static func fetchUsage() throws -> (UsageResponse, Data) {
-        let token = try accessToken()
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        request.timeoutInterval = 15
+        var creds = try loadCredentials()
+        // Refresh ahead of expiry so the widget never sits on a stale token overnight.
+        if let expiresAt = creds.expiresAt, expiresAt.timeIntervalSinceNow < 60 {
+            creds = try refreshCredentials(creds)
+        }
+        guard let token = creds.accessToken else { throw WidgetError.noCredentials }
 
-        let (data, response) = try syncRequest(request)
-        guard let http = response as? HTTPURLResponse else { throw WidgetError.badResponse }
+        var (data, http) = try usageRequest(token: token)
+        if http.statusCode == 401 {
+            // Token was revoked despite a future expiresAt — refresh once and retry.
+            creds = try refreshCredentials(creds)
+            guard let retryToken = creds.accessToken else { throw WidgetError.noCredentials }
+            (data, http) = try usageRequest(token: retryToken)
+        }
         switch http.statusCode {
         case 200:
             break
@@ -209,6 +217,17 @@ final class UsageModel: ObservableObject {
         return (try decode(data), data)
     }
 
+    private static func usageRequest(token: String) throws -> (Data, HTTPURLResponse) {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.timeoutInterval = 15
+
+        let (data, response) = try syncRequest(request)
+        guard let http = response as? HTTPURLResponse else { throw WidgetError.badResponse }
+        return (data, http)
+    }
+
     private static func decode(_ data: Data) throws -> UsageResponse {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
@@ -220,10 +239,30 @@ final class UsageModel: ObservableObject {
         return try decoder.decode(UsageResponse.self, from: data)
     }
 
-    private static func accessToken() throws -> String {
+    // MARK: Credentials
+
+    /// The keychain item Claude Code maintains:
+    /// `{"claudeAiOauth": {accessToken, refreshToken, expiresAt (ms epoch), ...}}`.
+    private struct Credentials {
+        var json: [String: Any]
+        var oauth: [String: Any]
+
+        var accessToken: String? { oauth["accessToken"] as? String }
+        var refreshToken: String? { oauth["refreshToken"] as? String }
+        var expiresAt: Date? {
+            (oauth["expiresAt"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
+        }
+    }
+
+    private static let keychainService = "Claude Code-credentials"
+    /// Claude Code's public OAuth client id — the refresh exchange must use the
+    /// same client the tokens were issued to.
+    private static let oauthClientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+    private static func loadCredentials() throws -> Credentials {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        process.arguments = ["find-generic-password", "-s", keychainService, "-w"]
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
@@ -232,10 +271,80 @@ final class UsageModel: ObservableObject {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard process.terminationStatus == 0,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String
+              let oauth = json["claudeAiOauth"] as? [String: Any]
         else { throw WidgetError.noCredentials }
-        return token
+        return Credentials(json: json, oauth: oauth)
+    }
+
+    /// Exchange the refresh token for a new access token, exactly as Claude Code
+    /// does on launch, and persist the result so both stay in sync.
+    private static func refreshCredentials(_ old: Credentials) throws -> Credentials {
+        guard let refreshToken = old.refreshToken else { throw WidgetError.authExpired }
+
+        var request = URLRequest(url: URL(string: "https://console.anthropic.com/v1/oauth/token")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 15
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id": oauthClientID,
+        ])
+
+        let (data, response) = try syncRequest(request)
+        guard let http = response as? HTTPURLResponse else { throw WidgetError.badResponse }
+        guard http.statusCode == 200 else {
+            WidgetLog.write("Token refresh failed (HTTP \(http.statusCode))")
+            throw WidgetError.authExpired
+        }
+        guard let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let accessToken = body["access_token"] as? String
+        else { throw WidgetError.badResponse }
+
+        var creds = old
+        creds.oauth["accessToken"] = accessToken
+        if let newRefresh = body["refresh_token"] as? String {
+            creds.oauth["refreshToken"] = newRefresh
+        }
+        if let expiresIn = body["expires_in"] as? Double {
+            creds.oauth["expiresAt"] = Int((Date().timeIntervalSince1970 + expiresIn) * 1000)
+        }
+        creds.json["claudeAiOauth"] = creds.oauth
+        try saveCredentials(creds)
+        let rotated = (body["refresh_token"] as? String).map { $0 != refreshToken } ?? false
+        WidgetLog.write("Access token refreshed and saved (refresh token rotated: \(rotated))")
+        return creds
+    }
+
+    private static func saveCredentials(_ creds: Credentials) throws {
+        let data = try JSONSerialization.data(withJSONObject: creds.json)
+        guard let json = String(data: data, encoding: .utf8) else { throw WidgetError.keychainWriteFailed }
+        // security's interactive parser honors double quotes with backslash escapes.
+        let escaped = json
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let command = """
+        add-generic-password -U -a "\(NSUserName())" -s "\(keychainService)" -w "\(escaped)"
+
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        // -i reads the command from stdin, keeping the tokens out of the argv
+        // that any local process could see in `ps`.
+        process.arguments = ["-i"]
+        let input = Pipe()
+        process.standardInput = input
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        try process.run()
+        input.fileHandleForWriting.write(command.data(using: .utf8)!)
+        try? input.fileHandleForWriting.close()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            WidgetLog.write("Keychain write failed (security exited \(process.terminationStatus))")
+            throw WidgetError.keychainWriteFailed
+        }
     }
 
     private static func syncRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
